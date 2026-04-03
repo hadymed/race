@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width,initial-scale=1" />
+	<title>Dark Road — Canvas</title>
+	<style>
+		:root{--bg:#0b0e12;--panel:#0f1318;--road:#4a4a4a;--line:#ffffff}
+		html,body{height:100%;margin:0}
+		body{
+			background:linear-gradient(180deg,#06070a 0%, #0b0e12 100%);
+			color:#ddd;
+			font-family: system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial;
+			display:flex;align-items:center;justify-content:center;
+		}
+		.stage{
+			width:420px; /* canvas + small padding */
+			padding:10px;
+			box-sizing:border-box;
+			background:rgba(255,255,255,0.02);
+			border:1px solid rgba(255,255,255,0.03);
+			border-radius:12px;
+			box-shadow:0 8px 30px rgba(2,4,8,0.8);
+			text-align:center;
+		}
+		h1{font-size:16px;margin:6px 0 12px;color:#cfd6db}
+		canvas{display:block;margin:0 auto;background:transparent;border-radius:6px}
+		.meta{font-size:12px;opacity:0.7;margin-top:8px}
+	</style>
+</head>
+<body>
+	<div class="stage">
+		<h1>Dark Road — Canvas</h1>
+		<canvas id="gameCanvas" width="400" height="600" aria-label="Game canvas"></canvas>
+		<div class="meta">Canvas: 400×600 — FPS loop running</div>
+	</div>
+
+	<script>
+		(() => {
+			const canvas = document.getElementById('gameCanvas');
+			const ctx = canvas.getContext('2d');
+			const W = canvas.width;
+			const H = canvas.height;
+
+			// Road / lanes
+			const roadWidth = Math.floor(W * 0.6);
+			const roadX = Math.floor((W - roadWidth) / 2);
+			const lanes = [];
+			const laneCount = 4; // two lanes flowing down, two lanes flowing up
+			for (let i = 0; i < laneCount; i++) lanes.push(roadX + (i + 0.5) * (roadWidth / laneCount));
+
+			// (no world/camera offset) using simple screen-space coordinates
+
+			// Utility: create Image from inline SVG
+			function imageFromSVG(svgString, callback) {
+				const img = new Image();
+				const svg = encodeURIComponent(svgString);
+				img.src = 'data:image/svg+xml;charset=utf-8,' + svg;
+				img.onload = () => callback(img);
+			}
+
+			// Simple embedded SVG assets (stylized, not trademarked)
+			const playerSVG = `
+				<svg xmlns='http://www.w3.org/2000/svg' width='40' height='70' viewBox='0 0 40 70'>
+					<rect rx='6' ry='6' width='40' height='70' fill='#2a74ff'/>
+					<rect x='6' y='12' width='28' height='14' rx='3' fill='#aac8ff' opacity='0.25'/>
+					<!-- stylized emblem -->
+					<g transform='translate(20,35)'>
+						<circle r='6' fill='#fff' opacity='0.12'/>
+						<path d='M-4 2 L0 -6 L4 2 Z' fill='#fff' opacity='0.85'/>
+					</g>
+				</svg>`;
+
+			const enemySVG = `
+				<svg xmlns='http://www.w3.org/2000/svg' width='40' height='70' viewBox='0 0 40 70'>
+					<rect rx='6' ry='6' width='40' height='70' fill='#d84141'/>
+					<rect x='6' y='12' width='28' height='14' rx='3' fill='#ffffff' opacity='0.08'/>
+					<!-- simple badge on roof -->
+					<g transform='translate(20,35)'>
+						<rect x='-6' y='-6' width='12' height='12' rx='2' fill='#fff' opacity='0.9'/>
+					</g>
+				</svg>`;
+
+			let playerImg, enemyImg, flameImg;
+			imageFromSVG(playerSVG, (img) => playerImg = img);
+			imageFromSVG(enemySVG, (img) => enemyImg = img);
+
+			// tiny flame SVG for exhaust
+			const flameSVG = `
+				<svg xmlns='http://www.w3.org/2000/svg' width='20' height='30' viewBox='0 0 20 30'>
+					<defs>
+						<linearGradient id='g' x1='0' x2='1'>
+							<stop offset='0' stop-color='#fff07a'/>
+							<stop offset='0.5' stop-color='#ffb74d'/>
+							<stop offset='1' stop-color='#ff4b4b'/>
+						</linearGradient>
+					</defs>
+					<path d='M10 30 C2 20 6 12 10 6 C14 12 18 20 10 30 Z' fill='url(#g)' opacity='0.95'/>
+				</svg>`;
+			imageFromSVG(flameSVG, (i) => flameImg = i);
+
+			// Physics and player
+			const player = {
+				width: 40,
+				height: 70,
+				x: lanes[1] - 20,
+				y: H - 70 - 16,
+				angle: 0,
+				speed: 0, // px/s
+				accel: 3500, // px/s^2 (throttle) - stronger for quicker response
+			brakeAccel: 2200, // px/s^2 (brake)
+			friction: 220, // passive friction/drag (lower for longer coasting)
+			maxSpeed: 1200, // px/s -> higher top speed
+			// steering: use max steer angle + response rate for smooth interpolation
+			maxSteer: 36, // degrees (allow sharper wheel)
+			steerResponse: 18, // how quickly angle approaches target (per second) - more responsive
+				accelerating: false,
+				braking: false,
+				turningLeft: false,
+				turningRight: false,
+			};
+
+			// Enemies: single-direction (downward) traffic
+			class Enemy {
+				constructor(laneIndex) {
+					this.width = 40; this.height = 70;
+					this.lane = laneIndex;
+					this.x = lanes[laneIndex] - this.width / 2;
+					this.state = 'driving';
+					this.laneChanging = false;
+					this.targetLane = laneIndex;
+					this.angle = 0;
+					this.turnSignal = null;
+					this.blinkTimer = 0;
+					this.speed = 110 + Math.random() * 120; // downward speed (slightly reduced)
+					this.y = -this.height - 8 - Math.random() * 160; // spawn off top edge
+				}
+
+				update(dt) {
+					// random chance to decide lane change
+					if (this.state === 'driving' && Math.random() < 0.002) {
+						const dir = (Math.random() < 0.5) ? -1 : 1;
+						const newLane = Math.max(0, Math.min(laneCount - 1, this.lane + dir));
+						if (newLane !== this.lane) {
+							this.targetLane = newLane;
+							this.laneChanging = true;
+							this.state = dir < 0 ? 'changingLeft' : 'changingRight';
+							this.turnSignal = dir < 0 ? 'left' : 'right';
+						}
+					}
+
+					// If behind another enemy in same lane, try to change
+					for (const other of enemies) {
+						if (other === this) continue;
+						if (other.lane === this.lane && other.y > this.y && other.y - this.y < 90) {
+							if (!this.laneChanging) {
+								const dir = (Math.random() < 0.5) ? -1 : 1;
+								const newLane = Math.max(0, Math.min(laneCount - 1, this.lane + dir));
+								if (newLane !== this.lane) {
+									this.targetLane = newLane;
+									this.laneChanging = true;
+									this.state = dir < 0 ? 'changingLeft' : 'changingRight';
+									this.turnSignal = dir < 0 ? 'left' : 'right';
+								}
+							}
+						}
+					}
+
+					// vertical downward movement
+					this.y += this.speed * dt;
+
+					// handle lane changing lateral movement
+					if (this.laneChanging) {
+						const targetX = lanes[this.targetLane] - this.width / 2;
+						const dx = targetX - this.x;
+						const lateral = Math.sign(dx) * Math.min(Math.abs(dx), 80 * dt);
+						this.x += lateral;
+						this.angle = (dx < 0 ? -12 : 12);
+						this.blinkTimer += dt;
+						if (Math.abs(dx) < 2) {
+							this.lane = this.targetLane;
+							this.laneChanging = false;
+							this.state = 'driving';
+							this.turnSignal = null;
+							this.angle = 0;
+						}
+					}
+				}
+
+				draw(ctx) {
+					const screenY = this.y;
+					if (screenY > H + 120 || screenY < -120) return;
+					ctx.save();
+					ctx.translate(this.x + this.width / 2, screenY + this.height / 2);
+					ctx.rotate(this.angle * Math.PI / 180);
+					ctx.drawImage(enemyImg || createPlaceholder(), -this.width / 2, -this.height / 2, this.width, this.height);
+
+					// turn signals
+					if (this.turnSignal) {
+						const on = Math.floor(this.blinkTimer * 4) % 2 === 0;
+						ctx.fillStyle = on ? '#ffb84d' : 'rgba(0,0,0,0.15)';
+						if (this.turnSignal === 'left') ctx.fillRect(-this.width / 2 - 2, -6, 4, 12);
+						if (this.turnSignal === 'right') ctx.fillRect(this.width / 2 - 2, -6, 4, 12);
+					}
+
+					ctx.restore();
+				}
+			}
+
+            
+
+			function createPlaceholder() {
+				const c = document.createElement('canvas');
+				c.width = 40; c.height = 70;
+				const g = c.getContext('2d');
+				g.fillStyle = '#999'; g.fillRect(0,0,40,70);
+				return c;
+			}
+
+			let enemies = [];
+			const enemySpawnInterval = 1.4; // increase interval to reduce traffic density
+			let enemySpawnTimer = 0;
+
+			// Skid marks storage
+			const skids = [];
+
+			// Game state
+			let gameOver = false;
+			let score = 0;
+
+			// Loop state
+			let lastTime = performance.now();
+			let fps = 0;
+
+			function resizeForDPR() {
+				const dpr = window.devicePixelRatio || 1;
+				if (dpr === 1) return;
+				canvas.width = W * dpr;
+				canvas.height = H * dpr;
+				canvas.style.width = W + 'px';
+				canvas.style.height = H + 'px';
+				ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			}
+
+			function roundRect(ctx, x, y, w, h, r) {
+				r = r || 6;
+				ctx.beginPath();
+				ctx.moveTo(x + r, y);
+				ctx.arcTo(x + w, y, x + w, y + h, r);
+				ctx.arcTo(x + w, y + h, x, y + h, r);
+				ctx.arcTo(x, y + h, x, y, r);
+				ctx.arcTo(x, y, x + w, y, r);
+				ctx.closePath();
+			}
+
+			// Road rendering with textured lane lines
+			function drawRoad() {
+				// background
+				ctx.fillStyle = '#0b0e12';
+				ctx.fillRect(0,0,W,H);
+
+				// road
+				const grad = ctx.createLinearGradient(0,0,0,H);
+				grad.addColorStop(0,'#3b3b3b');
+				grad.addColorStop(1,'#2f2f2f');
+				ctx.fillStyle = grad;
+				roundRect(ctx, roadX, 0, roadWidth, H, 4);
+				ctx.fill();
+
+				// textured edges
+				ctx.fillStyle = '#232323'; ctx.fillRect(roadX,0,6,H); ctx.fillRect(roadX+roadWidth-6,0,6,H);
+
+				// lane lines (detailed)
+				ctx.strokeStyle = '#f8f8f8';
+				ctx.lineWidth = 4;
+				ctx.lineCap = 'round';
+				for (let i=1;i<laneCount;i++){
+					const x = roadX + i*(roadWidth/laneCount);
+					ctx.setLineDash([18,18]);
+					ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+				}
+				ctx.setLineDash([]);
+			}
+
+			function drawPlayer() {
+				ctx.save();
+				ctx.translate(player.x + player.width/2, player.y + player.height/2);
+				ctx.rotate(player.angle * Math.PI/180);
+
+				// exhaust when accelerating
+				if (player.accelerating && flameImg) {
+					ctx.globalCompositeOperation = 'lighter';
+					ctx.drawImage(flameImg, -6, player.height/2 - 6, 12, 20);
+					ctx.globalCompositeOperation = 'source-over';
+				}
+
+				// draw car image
+				ctx.drawImage(playerImg || createPlaceholder(), -player.width/2, -player.height/2, player.width, player.height);
+
+				// brake lights
+				if (player.braking || player.speed < 1) {
+					ctx.fillStyle = '#ff2b2b';
+					ctx.fillRect(-player.width/2 + 6, player.height/2 - 12, 8, 6);
+					ctx.fillRect(player.width/2 - 14, player.height/2 - 12, 8, 6);
+				}
+
+				ctx.restore();
+			}
+
+			function spawnEnemy() {
+				// spawn a forward-moving enemy in a random lane, above the view
+				const lane = Math.floor(Math.random() * laneCount);
+				enemies.push(new Enemy(lane));
+			}
+
+			function rectsIntersect(a,b){
+				return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+			}
+
+			function drawSkids(dt){
+				for(let i=skids.length-1;i>=0;i--){
+					const s = skids[i];
+					ctx.strokeStyle = `rgba(10,10,10,${s.alpha})`;
+					ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(s.x-6,s.y); ctx.lineTo(s.x+6,s.y+4); ctx.stroke();
+					s.alpha -= dt * 0.6; if (s.alpha<=0) skids.splice(i,1);
+				}
+			}
+
+			function update(dt){
+				if(gameOver) return;
+
+				// controls
+				const accelInput = (keys.up || keys.w) ? 1 : 0;
+				const brakeInput = (keys.down || keys.s) ? 1 : 0;
+				const steerL = keys.left || keys.a;
+				const steerR = keys.right || keys.d;
+
+				player.accelerating = accelInput > 0;
+				player.braking = brakeInput > 0;
+
+				// instantaneous speed control (no acceleration ramp)
+				if (accelInput) {
+					// set to top speed immediately
+					player.speed = player.maxSpeed;
+				} else if (brakeInput) {
+					// immediate stop when braking
+					player.speed = 0;
+				}
+				// clamp speed to forward-only
+				player.speed = Math.max(0, Math.min(player.maxSpeed, player.speed));
+
+				// steering: interpolate toward a desired target angle for smooth, predictable turns
+				const steerInput = (steerL ? -1 : 0) + (steerR ? 1 : 0);
+				const speedRatio = Math.min(player.speed / player.maxSpeed, 1);
+				const steerScale = 1 - speedRatio * 0.35; // less reduction at high speed
+				const desiredAngle = steerInput * player.maxSteer * steerScale;
+				const t = Math.min(1, player.steerResponse * dt);
+				player.angle += (desiredAngle - player.angle) * t;
+
+				// lateral movement depending on angle and forward speed (more responsive)
+				const lateralVelocity = Math.sin(player.angle * Math.PI / 180) * (28 + player.speed * 0.05);
+				player.x += lateralVelocity * dt;
+				// clamp to road bounds
+				const minX = roadX + 8; const maxX = roadX + roadWidth - player.width - 8;
+				if(player.x < minX) player.x = minX;
+				if(player.x > maxX) player.x = maxX;
+
+				// generate skid marks when braking hard
+				if(brakeInput && player.speed > 150){ skids.push({x: player.x + player.width/2, y: player.y + player.height/2, alpha:1}); }
+
+				// spawn enemies
+				enemySpawnTimer += dt;
+				if (enemySpawnTimer >= enemySpawnInterval) { enemySpawnTimer = 0; spawnEnemy(); }
+
+				// update enemies (screen-space Y)
+				for (let i = enemies.length - 1; i >= 0; i--) {
+					const e = enemies[i]; e.update(dt);
+					const screenY = e.y;
+					// remove if far below screen
+					if (screenY > H + 120) { enemies.splice(i, 1); continue; }
+
+					// collision check in screen space
+					const pbox = { x: player.x, y: player.y, width: player.width, height: player.height };
+					const ebox = { x: e.x, y: screenY, width: e.width, height: e.height };
+					if (rectsIntersect(pbox, ebox)) { gameOver = true; }
+				}
+			}
+
+			function drawTelemetry(){
+				// score
+				ctx.fillStyle = '#ffffff'; ctx.font='20px system-ui'; ctx.textAlign='left'; ctx.fillText('Score: '+score,10,26);
+				// fps
+				ctx.fillStyle='rgba(255,255,255,0.8)'; ctx.font='12px system-ui'; ctx.fillText('FPS: '+Math.round(fps),10,46);
+
+				// speed in km/h mapping
+				const kmh = Math.round((player.speed / player.maxSpeed) * 220);
+				const gear = kmh<=0? '(Stopped)' : (kmh<40? 'G1' : kmh<80? 'G2' : kmh<130? 'G3' : kmh<180? 'G4' : 'G5');
+				ctx.fillStyle='#fff'; ctx.font='14px system-ui'; ctx.fillText(`Speed: ${kmh} km/h ${gear}`, 10, 68);
+
+				// small gear icon placeholder
+				ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(165,60,8,0,Math.PI*2); ctx.stroke();
+
+				// analogue speedometer
+				drawSpeedometer(100, 110, 60, kmh);
+
+				// top-right mini block
+				ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fillRect(W-118,8,110,44); ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.strokeRect(W-118,8,110,44);
+				ctx.fillStyle='#fff'; ctx.font='12px system-ui'; ctx.fillText('Score:'+score, W-110, 26); ctx.fillText('FPS:'+Math.round(fps), W-110, 44);
+			}
+
+			function drawSpeedometer(x,y,r,speedKmh){
+				const max = 220; const ang = (speedKmh/max) * Math.PI * 1.2 - Math.PI*0.1; // sweep
+				// background
+				ctx.save(); ctx.translate(x,y);
+				ctx.beginPath(); ctx.arc(0,0,r,Math.PI*0.9,Math.PI*2.1); ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=10; ctx.stroke();
+				// ticks
+				for(let i=0;i<=10;i++){ const a = Math.PI*0.9 + (i/10)*(Math.PI*1.2); const sx=Math.cos(a)*(r-6), sy=Math.sin(a)*(r-6); const ex=Math.cos(a)*r, ey=Math.sin(a)*r; ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(ex,ey); ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=2; ctx.stroke(); }
+				// needle
+				ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(Math.cos(ang)*(r-12), Math.sin(ang)*(r-12)); ctx.strokeStyle='red'; ctx.lineWidth=2.5; ctx.stroke();
+				ctx.restore();
+			}
+
+			function render(now){
+				const dt = (now - lastTime)/1000; lastTime = now; fps = 1/Math.max(dt,1/240);
+
+				update(dt);
+				// increment score as frames pass
+				if(!gameOver) score++;
+
+				// draw scene
+				drawRoad();
+				// draw skids first
+				drawSkids(dt);
+				// draw enemies
+				for(const e of enemies) e.draw(ctx);
+				// draw player
+				drawPlayer();
+
+				// telemetry and UI
+				drawTelemetry();
+
+				// bottom bar
+				ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.fillRect(0,H-22,W,22);
+				ctx.fillStyle='#ddd'; ctx.font='12px system-ui'; ctx.textAlign='center'; ctx.fillText('Canvas: 400x600 — FPS loop running', W/2, H-6);
+
+				if(gameOver){ drawGameOverOverlay(); }
+				else requestAnimationFrame(render);
+			}
+
+			function drawGameOverOverlay(){
+				ctx.save(); ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+				ctx.fillStyle='#ff4b4b'; ctx.font='48px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('GAME OVER', W/2, H/2 - 12);
+				ctx.fillStyle='#fff'; ctx.font='18px system-ui'; ctx.fillText("Press 'R' to Restart", W/2, H/2 + 30);
+				ctx.restore();
+			}
+
+			function restartGame(){
+				player.x = lanes[Math.floor(laneCount/2)] - player.width/2;
+				player.y = H - player.height - 16; player.speed = 0; player.angle = 0;
+				enemies = []; enemySpawnTimer = 0; skids.length = 0; score = 0; gameOver = false; lastTime = performance.now(); requestAnimationFrame(render);
+			}
+
+			// keyboard
+			const keys = { up:false, down:false, left:false, right:false, w:false, a:false, s:false, d:false };
+			window.addEventListener('keydown', (e)=>{
+				if(e.code==='ArrowUp') keys.up = true; if(e.code==='ArrowDown') keys.down = true; if(e.code==='ArrowLeft') keys.left = true; if(e.code==='ArrowRight') keys.right = true;
+				if(e.code==='KeyW') keys.w=true; if(e.code==='KeyA') keys.a=true; if(e.code==='KeyS') keys.s=true; if(e.code==='KeyD') keys.d=true;
+				if((e.code==='KeyR' || e.key==='r' || e.key==='R') && gameOver){ e.preventDefault(); restartGame(); }
+			});
+			window.addEventListener('keyup', (e)=>{
+				if(e.code==='ArrowUp') keys.up = false; if(e.code==='ArrowDown') keys.down = false; if(e.code==='ArrowLeft') keys.left = false; if(e.code==='ArrowRight') keys.right = false;
+				if(e.code==='KeyW') keys.w=false; if(e.code==='KeyA') keys.a=false; if(e.code==='KeyS') keys.s=false; if(e.code==='KeyD') keys.d=false;
+			});
+
+			// init
+			resizeForDPR();
+			requestAnimationFrame((t)=>{ lastTime = t; requestAnimationFrame(render); });
+
+			window.addEventListener('resize', ()=>{ canvas.width = W; canvas.height = H; canvas.style.width = W + 'px'; canvas.style.height = H + 'px'; ctx.setTransform(1,0,0,1,0,0); resizeForDPR(); });
+		})();
+	</script>
+</body>
+</html>
